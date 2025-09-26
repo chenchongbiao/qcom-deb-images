@@ -1,0 +1,218 @@
+name: my Build debos recipe
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      mainline_kernel:
+        description: Whether to use a mainline kernel deb
+        type: boolean
+        default: false
+      overlays:
+        description: List of overlays to use
+        type: string
+        default: qsc-deb-releases
+      kernelpackage:
+        description: Name of kernel package to use
+        type: string
+        # the package name will be passed to APT which interprets the trailing
+        # plus sign in the package name as a request to install the package, so
+        # use two plus signs
+        default: linux-image-6.16.7-qcom1++
+
+    outputs:
+      artifacts_url:
+        description: "URL to retrieve build artifacts"
+        value: ${{ jobs.build-debos.outputs.url }}
+
+# implicitely set all other permissions to none
+permissions:
+  contents: read # actions/checkout
+
+env:
+  # image build id; used for SBOM generation
+  BUILD_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+
+jobs:
+  build-debos:
+    name: Build and upload debos recipes
+    outputs:
+      url: ${{ steps.upload_artifacts.outputs.url }}
+    runs-on: ubuntu-latest
+    container:
+      image: public.ecr.aws/debian/debian:trixie
+      volumes:
+        - /efs/qli/metaqcom/gh-runners/quic-yocto/downloads:/fileserver-downloads
+      options: --privileged
+    steps:
+      # make sure we have latest packages first, to get latest fixes and to
+      # avoid an automated update while we're building
+      - name: Update OS packages
+        run: |
+          set -ux
+          apt update
+          apt -y upgrade
+          apt -y full-upgrade
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Copy U-Boot for RB1 from fileserver space for downloads
+        run: |
+          ls -l /fileserver-downloads/qcom-deb-images
+          cp -av "/fileserver-downloads/qcom-deb-images/u-boot-rb1-latest/rb1-boot.img" .
+
+      # mtools is needed for the flash recipe
+      - name: Install debos and dependencies of the recipes
+        run: apt -y install debos mtools
+
+      - name: Setup local APT repo
+        run: |
+          set -ux -o pipefail
+
+          # needed for apt-ftparchive
+          apt -y install --no-install-recommends apt-utils
+          mkdir -v local-apt-repo
+
+          # optionally, copy mainline kernel debs
+          if [ "${{ inputs.mainline_kernel }}" = true ]; then
+              mkdir -v local-apt-repo/linux-deb-latest
+              # get mainline kernel from the fileserver space for downloads
+              cp -av /fileserver-downloads/qcom-deb-images/linux-deb-latest/*.deb \
+                  local-apt-repo/linux-deb-latest
+          fi
+
+          (
+              cd local-apt-repo
+              apt-ftparchive packages . >Packages
+              apt-ftparchive release . >Release
+          )
+
+      - name: Build rootfs with debos
+        run: |
+          set -ux
+          debos \
+              -t overlays:'${{ inputs.overlays }}' \
+              -t xfcedesktop:true \
+              -t aptlocalrepo:${PWD}/local-apt-repo \
+              -t kernelpackage:'${{ inputs.kernelpackage }}' \
+              -t "buildid:${BUILD_ID}" \
+              --print-recipe \
+              debos-recipes/qualcomm-linux-debian-rootfs.yaml
+
+      - name: Build UFS and SD card images with debos
+        run: |
+          set -ux
+          # debos tries KVM and UML as backends, and falls back to
+          # building directly on the host, but that requires loop
+          # devices; use qemu backend explicitly even if it's slower;
+          # qemu backend also requires to set scratchsize, otherwise the
+          # whole build is done from memory and the out of memory killer
+          # gets triggered
+          debos -b qemu --scratchsize 4GiB -t imagetype:ufs \
+              --print-recipe \
+              debos-recipes/qualcomm-linux-debian-image.yaml
+          debos -b qemu --scratchsize 4GiB -t imagetype:sdcard \
+              --print-recipe \
+              debos-recipes/qualcomm-linux-debian-image.yaml
+
+      - name: Build flashable files with debos
+        run: |
+          set -ux
+          debos -t u_boot_rb1:rb1-boot.img \
+              --print-recipe \
+              debos-recipes/qualcomm-linux-debian-flash.yaml
+
+      - name: Stage debos artifacts for publishing
+        run: |
+          set -ux
+          # create a directory for the current run
+          dir="debos-artifacts"
+          mkdir -v "${dir}"
+          # copy output files
+          cp -av rootfs.tar.gz "${dir}"
+          cp -av dtbs.tar.gz "${dir}"
+          cp -av disk-ufs.img.gz "${dir}"
+          cp -av disk-sdcard.img.gz "${dir}"
+          # TODO: separate flash_* directories between UFS and eMMC
+          tar -cvf "${dir}"/flash-ufs.tar.gz \
+              disk-ufs.img1 \
+              disk-ufs.img2 \
+              flash_qcs615-* \
+              flash_qcs6490-* \
+              flash_qcs8300-* \
+              flash_qcs9100-*
+          tar -cvf "${dir}"/flash-emmc.tar.gz \
+              disk-sdcard.img1 \
+              disk-sdcard.img2 \
+              flash_qrb2210-*
+
+      - name: Upload private artifacts
+        uses: qualcomm-linux/upload-private-artifact-action@v1
+        id: upload_artifacts
+        with:
+          path: debos-artifacts
+
+      - name: Unpack rootfs to generate SBOM
+        run: mkdir -v rootfs && tar -C rootfs -xf rootfs.tar.gz
+
+      # Syft is not packaged in Debian; it's available as a binary tarball or
+      # as container image from upstream; it's available on arm64 and x86
+      - name: Install Syft
+        run: |
+          set -ux
+          apt -y install curl
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh
+
+      - name: Generate SBOMs with Syft
+        run: |
+          set -ux
+          bin/syft --version
+          SYFT_FORMAT_PRETTY=true bin/syft \
+              -o cyclonedx-json=rootfs-sbom.cyclonedx.json \
+              -o spdx-json=rootfs-sbom.spdx.json \
+              -o syft-json=rootfs-sbom.syft.json \
+              -o syft-text=rootfs-sbom.syft.txt \
+              -o syft-table \
+              --parallelism `nproc` \
+              --select-catalogers debian \
+              --source-name qualcomm-linux-debian-rootfs \
+              --source-version "${BUILD_ID}" \
+              -v \
+              scan rootfs
+
+      - name: Generate license summary from Syft report
+        run: |
+          set -ux
+          scripts/syft-license-summary.py \
+              --rootfs rootfs rootfs-sbom.syft.json |
+                  tee rootfs-sbom.syft-license-summary.csv.txt
+
+      - name: Stage SBOMs for publishing
+        run: |
+          set -ux
+          gzip rootfs-sbom.*
+          dir="sboms"
+          mkdir -v sboms
+          cp -av rootfs-sbom.*.gz sboms
+
+      - name: Upload SBOMs as private artifacts
+        uses: qualcomm-linux/upload-private-artifact-action@v1
+        id: upload_sbom_artifacts
+        with:
+          path: sboms
+      - name: "Print output"
+        env:
+          build_url: ${{ steps.upload_artifacts.outputs.url }}
+        run: |
+          echo "Downloads URL: ${build_url}"
+          echo "url=\"${build_url}\"" >> $GITHUB_OUTPUT
+          echo "${build_url}" > build_url
+          echo "## Download URL" >> $GITHUB_STEP_SUMMARY
+          echo "[${build_url}](${build_url})" >> $GITHUB_STEP_SUMMARY
+      - name: Upload build URL
+        uses: actions/upload-artifact@v4
+        with:
+          name: build_url
+          path: build_url

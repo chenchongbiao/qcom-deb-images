@@ -1,4 +1,4 @@
-name: Build U-Boot for RB1
+name: my Build U-Boot for RB1
 
 on:
   # run weekly on Monday at 8:30am
@@ -25,10 +25,8 @@ concurrency:
 
 jobs:
   build-u-boot-rb1:
-    # don't run cron from forks of the main repository or from other branches
-    if: github.repository == 'qualcomm-linux/qcom-deb-images' && github.ref == 'refs/heads/main'
     # for cross-builds
-    runs-on: [self-hosted, qcom-u2404, amd64]
+    runs-on: ubuntu-latest
     # alternative for native builds, but overkill to do both
     #runs-on: [self-hosted, qcom-u2404, arm64]
     container:
@@ -89,9 +87,10 @@ jobs:
           )
           # perhaps help NFS sync
           sync
-        artifacts:
-          name: "u-boot-rb1"
-          paths:
-            - /fileserver-downloads
-          expire_in: 14d
+
+      - name: Upload private artifacts
+        uses: qualcomm-linux/upload-private-artifact-action@v1
+        id: upload_artifacts
+        with:
+          path: artifacts
 
